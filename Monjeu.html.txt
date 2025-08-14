@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Knockout Duel — 2 joueurs</title>
+  <style>
+    :root { --bg:#0b1220; --arena:#1f2b4a; --arenaEdge:#2f3f6b; --p1:#00bcd4; --p2:#ff6d00; --white:#eaf2ff;}
+    *{box-sizing:border-box} html,body{margin:0;height:100%;background:radial-gradient(1200px 600px at 50% 50%, #0f1830 0%, #0b1220 60%, #060a14 100%); color:var(--white); font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,"Noto Sans",sans-serif;}
+    #wrap{display:flex; align-items:center; justify-content:center; height:100%;}
+    canvas{border-radius:16px; box-shadow:0 20px 60px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.06); background:linear-gradient(180deg, #0b1326, #0b1220);}
+    #hud{position:fixed; inset:16px 16px auto 16px; display:flex; gap:16px; align-items:center; justify-content:center; pointer-events:none; font-weight:700; letter-spacing:.5px}
+    .pill{padding:8px 12px; border-radius:999px; background:rgba(255,255,255,.06); backdrop-filter:blur(6px); box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}
+    #score{font-size:18px;}
+    #help{position:fixed; left:16px; bottom:16px; right:16px; display:flex; gap:12px; flex-wrap:wrap; justify-content:center; opacity:.9}
+    kbd{background:#111726; border:1px solid rgba(255,255,255,.1); padding:2px 6px; border-radius:6px; font-weight:700}
+    #banner{position:fixed; inset:auto 16px 16px 16px; text-align:center; font-weight:800; letter-spacing:.6px}
+    .big{font-size:24px}
+    .small{opacity:.8; font-weight:600}
+    a.btn{pointer-events:auto; text-decoration:none; color:var(--white); border:1px solid rgba(255,255,255,.14); padding:6px 10px; border-radius:10px}
+  </style>
+</head>
+<body>
+  <div id="wrap"><canvas id="game" width="900" height="600" aria-label="Knockout Duel"></canvas></div>
+
+  <div id="hud">
+    <div class="pill" id="score">P1: 0 — P2: 0</div>
+    <div class="pill" id="state"></div>
+    <a class="btn" id="resetBtn" href="#">Recommencer</a>
+  </div>
+
+  <div id="help" class="small">
+    <div class="pill">P1: <kbd>Z</kbd>/<kbd>W</kbd> <kbd>Q</kbd>/<kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> • Dash: <kbd>Shift gauche</kbd></div>
+    <div class="pill">P2: <kbd>↑</kbd> <kbd>←</kbd> <kbd>↓</kbd> <kbd>→</kbd> • Dash: <kbd>Shift droit</kbd> ou <kbd>Entrée</kbd></div>
+    <div class="pill">Pause: <kbd>P</kbd> • Nouvelle manche: <kbd>Espace</kbd>/<kbd>Entrée</kbd></div>
+  </div>
+
+  <div id="banner">
+    <div class="big" id="msg">Appuie sur <kbd>Espace</kbd> ou <kbd>Entrée</kbd> pour jouer</div>
+    <div class="small">Éjecte ton adversaire hors du cercle. Premier à 3 points gagne.</div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const CX = W/2, CY = H/2;
+    const ARENA_R = 250;
+    const EDGE_THICK = 8;
+
+    // Physique
+    const ACC = 1200;
+    const FRICTION = 2.5;          // résistance (1/s)
+    const MAX_SPEED = 420;
+    const RADIUS = 22;
+    const BOUNCE = 0.85;
+    const DASH_FORCE = 780;
+    const DASH_TIME = 0.18;        // s
+    const DASH_CD = 1.2;           // s
+    const KO_DELAY = 1.2;          // s avant nouvelle manche
+    const WIN_SCORE = 3;
+
+    // État
+    const keys = {};
+    let lastTime = performance.now();
+    let state = 'ready'; // 'playing' | 'roundOver' | 'paused' | 'ready' | 'gameOver'
+    let roundTimer = 0;
+
+    const p1 = makePlayer('P1', CX - 150, CY, getColor('--p1'));
+    const p2 = makePlayer('P2', CX + 150, CY, getColor('--p2'));
+    const players = [p1, p2];
+
+    function getColor(varName){ return getComputedStyle(document.documentElement).getPropertyValue(varName).trim(); }
+    function makePlayer(name, x, y, color){
+      return {name, x, y, vx:0, vy:0, r:RADIUS, color, score:0, out:false,
+              dash:{active:0, cd:0}};
+    }
+    function resetRound(centerStart=false){
+      players.forEach(p=>{
+        p.vx = p.vy = 0;
+        p.out = false;
+        p.dash.active = 0;
+        if(p.name==='P1'){
+          p.x = CX - (centerStart? 60 : 150);
+          p.y = CY + (centerStart? 0 : 0);
+        }else{
+          p.x = CX + (centerStart? 60 : 150);
+          p.y = CY + (centerStart? 0 : 0);
+        }
+      });
+      state = 'countdown';
+      roundTimer = 2.0; // 2 -> 1 -> GO
+      setMsg('3… 2… 1…');
+    }
+    function fullReset(){
+      p1.score = p2.score = 0;
+      document.getElementById('score').textContent = `P1: ${p1.score} — P2: ${p2.score}`;
+      state = 'ready';
+      setMsg('Appuie sur Espace ou Entrée pour jouer');
+    }
+
+    // Entrées clavier
+    window.addEventListener('keydown', e=>{
+      keys[e.code] = true;
+      if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','Enter'].includes(e.code)){
+        e.preventDefault();
+      }
+      // Démarrer facilement
+      if(state==='ready' && (e.code==='Space' || e.code==='Enter')) { resetRound(); }
+      if(state==='roundOver' && (e.code==='Space' || e.code==='Enter')) { resetRound(); }
+      if(state==='gameOver' && (e.code==='Space' || e.code==='Enter')) { fullReset(); }
+      if(e.code==='KeyP'){ togglePause(); }
+    });
+    window.addEventListener('keyup', e=>{ keys[e.code] = false; });
+
+    document.getElementById('resetBtn').addEventListener('click', (e)=>{ e.preventDefault(); fullReset(); });
+
+    function togglePause(){
+      if(state==='playing'){ state='paused'; setState('Pause'); }
+      else if(state==='paused'){ state='playing'; setState(''); }
+    }
+
+    // Boucle
+    function loop(t){
+      const dt = Math.min(0.033, (t - lastTime)/1000); // cap à ~30 FPS pour robustesse si onglet inactif
+      lastTime = t;
+
+      // Update
+      if(state==='countdown'){
+        roundTimer -= dt;
+        if(roundTimer<=0){
+          state='playing';
+          setMsg('');
+          setState('');
+        }else{
+          setState('Préparez-vous…');
+        }
+      }else if(state==='playing'){
+        updatePlayer(p1, dt, getInputP1());
+        updatePlayer(p2, dt, getInputP2());
+        collidePlayers(p1, p2, dt);
+
+        // KO si hors de l'arène
+        players.forEach(p=>{
+          const d = Math.hypot(p.x - CX, p.y - CY);
+          if(d > ARENA_R - p.r){ p.out = true; }
+        });
+
+        const outCount = players.filter(p=>p.out).length;
+        if(outCount>0){
+          state='roundOver';
+          roundTimer = KO_DELAY;
+          let msg='Égalité !';
+          if(p1.out && !p2.out){ p2.score++; msg='Point P2 !'; }
+          else if(!p1.out && p2.out){ p1.score++; msg='Point P1 !'; }
+          setMsg(msg);
+          document.getElementById('score').textContent = `P1: ${p1.score} — P2: ${p2.score}`;
+          if(p1.score>=WIN_SCORE || p2.score>=WIN_SCORE){
+            state='gameOver';
+            setMsg(`${p1.score>p2.score?'P1':'P2'} gagne le match !  (Espace/Entrée pour rejouer)`);
+          }
+        }
+      }else if(state==='roundOver'){
+        roundTimer -= dt;
+        if(roundTimer<=0 && (p1.score<WIN_SCORE && p2.score<WIN_SCORE)){
+          resetRound(true);
+        }
+      }
+
+      // Draw
+      draw();
+
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+
+    function getInputP1(){
+      // Support ZQSD ou WASD
+      const up = keys['KeyW'] || keys['KeyZ'];
+      const left = keys['KeyA'] || keys['KeyQ'];
+      const down = keys['KeyS'];
+      const right = keys['KeyD'];
+      const dash = keys['ShiftLeft'];
+      return {up,left,down,right,dash};
+    }
+    function getInputP2(){
+      const up = keys['ArrowUp'];
+      const left = keys['ArrowLeft'];
+      const down = keys['ArrowDown'];
+      const right = keys['ArrowRight'];
+      const dash = keys['ShiftRight'] || keys['Enter'] || keys['Numpad0'];
+      return {up,left,down,right,dash};
+    }
+
+    function updatePlayer(p, dt, input){
+      // direction voulue
+      let ix = (input.right?1:0) - (input.left?1:0);
+      let iy = (input.down?1:0) - (input.up?1:0);
+      const len = Math.hypot(ix, iy) || 1;
+      ix /= len; iy /= len;
+
+      // dash
+      p.dash.cd = Math.max(0, p.dash.cd - dt);
+      p.dash.active = Math.max(0, p.dash.active - dt);
+      if(input.dash && p.dash.cd===0 && (Math.abs(ix)+Math.abs(iy) > 0)){
+        p.vx += ix * DASH_FORCE;
+        p.vy += iy * DASH_FORCE;
+        p.dash.active = DASH_TIME;
+        p.dash.cd = DASH_CD;
+      }
+
+      // accélération + friction
+      p.vx += ix * ACC * dt;
+      p.vy += iy * ACC * dt;
+      const speed = Math.hypot(p.vx, p.vy);
+      if(speed > MAX_SPEED){
+        const s = MAX_SPEED / speed;
+        p.vx *= s; p.vy *= s;
+      }
+      const drag = Math.max(0, 1 - FRICTION*dt);
+      p.vx *= drag; p.vy *= drag;
+
+      // déplacement
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+    }
+
+    function collidePlayers(a, b, dt){
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.hypot(dx, dy) || 0.0001;
+      const minDist = a.r + b.r;
+      if(dist < minDist){
+        // Séparer
+        const overlap = (minDist - dist);
+        const nx = dx / dist, ny = dy / dist;
+        a.x -= nx * overlap/2; a.y -= ny * overlap/2;
+        b.x += nx * overlap/2; b.y += ny * overlap/2;
+
+        // Impulsion élastique simple
+        const rvx = b.vx - a.vx, rvy = b.vy - a.vy;
+        const velAlongNormal = rvx*nx + rvy*ny;
+        if(velAlongNormal < 0){
+          const e = BOUNCE + dashBoost(a,b); // restitution + boost si dash
+          const j = -(1+e) * velAlongNormal / 2; // masses égales
+          const ix = j * nx, iy = j * ny;
+          a.vx -= ix; a.vy -= iy;
+          b.vx += ix; b.vy += iy;
+        }
+      }
+    }
+    function dashBoost(a,b){
+      // si l'un dash, collision plus violente
+      const boost = 0.45;
+      return (a.dash.active>0 || b.dash.active>0) ? boost : 0;
+    }
+
+    function draw(){
+      ctx.clearRect(0,0,W,H);
+
+      // arrière-plan doux
+      const gbg = ctx.createRadialGradient(CX, CY, 60, CX, CY, 480);
+      gbg.addColorStop(0, '#0e1730'); gbg.addColorStop(1, '#0a1122');
+      ctx.fillStyle = gbg; ctx.fillRect(0,0,W,H);
+
+      // arène
+      ctx.save();
+      ctx.translate(CX, CY);
+      // anneau
+      ctx.beginPath();
+      ctx.arc(0, 0, ARENA_R+EDGE_THICK, 0, Math.PI*2);
+      const edge = ctx.createRadialGradient(0,0,ARENA_R-12, 0,0,ARENA_R+EDGE_THICK);
+      edge.addColorStop(0, getColor('--arena'));
+      edge.addColorStop(1, getColor('--arenaEdge'));
+      ctx.fillStyle = edge; ctx.fill();
+
+      // surface
+      ctx.beginPath();
+      ctx.arc(0, 0, ARENA_R, 0, Math.PI*2);
+      const surf = ctx.createRadialGradient(0,0,12, 0,0,ARENA_R);
+      surf.addColorStop(0, 'rgba(255,255,255,0.06)');
+      surf.addColorStop(1, 'rgba(255,255,255,0.02)');
+      ctx.fillStyle = surf; ctx.fill();
+
+      // marques
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 2;
+      for(let r=50;r<ARENA_R;r+=50){
+        ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.stroke();
+      }
+      ctx.restore();
+
+      // joueurs
+      for(const p of players){
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        if(p.out){
+          ctx.globalAlpha = 0.35;
+        }
+        // halo si dash
+        if(p.dash.active>0){
+          ctx.beginPath();
+          ctx.arc(0,0,p.r+6,0,Math.PI*2);
+          ctx.fillStyle = 'rgba(255,255,255,0.15)';
+          ctx.fill();
+        }
+        // corps
+        ctx.beginPath();
+        ctx.arc(0,0,p.r,0,Math.PI*2);
+        ctx.fillStyle = p.color;
+        ctx.fill();
+        // liseré
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    function setMsg(text){ document.getElementById('msg').innerHTML = text; }
+    function setState(text){ document.getElementById('state').textContent = text; }
+  </script>
+</body>
+</html>
